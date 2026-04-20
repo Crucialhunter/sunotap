@@ -1,7 +1,7 @@
 <div align="center">
 
 <!-- Replace with actual logo once ready -->
-<img src="assets/logo.png" alt="SunoTap logo" width="180" />
+<img src="assets/Logo-sunotap.png" alt="SunoTap logo" width="180" />
 
 # SunoTap
 
@@ -13,9 +13,6 @@ Generate music on [Suno AI v5.5](https://suno.com) without touching the web inte
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078d4?logo=windows&logoColor=white)](https://github.com)
 [![Unofficial](https://img.shields.io/badge/Suno-Unofficial%20Client-ff6b35)](https://suno.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-
-<!-- Replace with your terminal demo GIF -->
-<img src="assets/demo.gif" alt="SunoTap demo" width="700" />
 
 </div>
 
