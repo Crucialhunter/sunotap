@@ -18,3 +18,7 @@ node_modules/
 
 # Claude context interno (rutas y datos personales)
 CLAUDE.md
+
+# Assets — logo and demo GIF tracked manually once ready
+# assets/logo.png
+# assets/demo.gif
