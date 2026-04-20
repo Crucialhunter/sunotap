@@ -1,7 +1,6 @@
 <div align="center">
 
-<!-- Replace with actual logo once ready -->
-<img src="assets/Logo-sunotap.png" alt="SunoTap logo" width="180" />
+<img src="assets/Logo-sunotap.png" alt="SunoTap logo" width="380" />
 
 # SunoTap
 
@@ -30,12 +29,12 @@ One login. Your session is saved. After that, it's pure HTTP — no browser proc
 
 ```mermaid
 flowchart LR
-    A[suno-login.exe\nWebView2 window] -->|captures httpOnly cookies\nvia COM ICoreWebView2CookieManager| B[(~/.suno/config.json)]
-    B -->|long-lived __session cookie\nlasts weeks/months| C[suno.py]
-    C -->|POST clerk.suno.com/v1/client/sessions/{id}/tokens| D[JWT Bearer\n~60s TTL]
-    D -->|Authorization: Bearer| E[studio-api-prod.suno.com\n/api/generate/v2-web/]
-    E --> F[2 clips submitted]
-    F -->|poll every 8–20s| G[MP3 ready ✓]
+    A["suno-login.exe"] -->|"saves httpOnly cookies"| B[("~/.suno/config.json")]
+    B -->|"long-lived session cookie"| C["suno.py"]
+    C -->|"exchanges cookie for JWT"| D["JWT Bearer (60s TTL)"]
+    D -->|"Authorization: Bearer"| E["Suno API"]
+    E --> F["2 clips submitted"]
+    F -->|"poll every 8-20s"| G["MP3 ready"]
 ```
 
 > **Why the Tauri app?** `httpOnly` cookies can't be read via JavaScript (`document.cookie`). `suno-login.exe` accesses them through WebView2's native COM API as the host process — the only reliable way on Windows without admin rights.
