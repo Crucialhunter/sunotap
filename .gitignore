@@ -1,0 +1,20 @@
+# Auth — nunca commitear
+~/.suno/
+config.json
+
+# Binarios compilados
+suno-login.exe
+suno-login/src-tauri/target/
+suno-login/icon-source.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Claude context interno (rutas y datos personales)
+CLAUDE.md
