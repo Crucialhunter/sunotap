@@ -13,10 +13,12 @@ Note: first-time login is handled by suno-login.exe (Tauri app, pendiente).
 """
 
 import argparse
+import base64
 import json
 import random
 import sys
 import time
+import uuid
 from pathlib import Path
 
 try:
@@ -146,7 +148,7 @@ def _get_jwt_with_fallback(token_arg: str | None) -> str:
     config = _load_config()
 
     # 2. Cached JWT still valid
-    if config.get("jwt") and time.time() - config.get("jwt_saved_at", 0) < 55:
+    if config.get("jwt") and time.time() - (config.get("jwt_saved_at") or 0) < 55:
         return config["jwt"]
 
     # 3a. Refresh using all browser cookies (saved by suno-login — preferred)
@@ -198,11 +200,36 @@ def _human_wait(min_s=8, max_s=20, label="Polling in"):
     print(f"  {label} {delay:.1f}s...   ", end="\r")
     time.sleep(delay)
 
+
+def _browser_token() -> str:
+    """Fresh Browser-Token header — timestamp-based, required by Suno API since ~2026-04."""
+    ts = int(time.time() * 1000)
+    payload = json.dumps({"timestamp": ts}, separators=(',', ':'))
+    token_b64 = base64.b64encode(payload.encode()).decode()
+    return json.dumps({"token": token_b64}, separators=(',', ':'))
+
+
+def _device_id() -> str:
+    """Device-Id header — from saved suno_device_id cookie, or a stable generated UUID."""
+    config = _load_config()
+    raw = (config.get("browser_cookies") or {}).get("suno_device_id") or config.get("device_id")
+    if not raw:
+        raw = str(uuid.uuid4())
+        _save_config({"device_id": raw})
+    return f"default-{raw}"
+
+
 # ── API calls ────────────────────────────────────────────────────────────────
 
 def generate(jwt: str, args) -> list[str]:
     """Build payload from args and submit generation. Returns clip IDs."""
-    headers = {**BASE_HEADERS, "Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
+    headers = {
+        **BASE_HEADERS,
+        "Authorization": f"Bearer {jwt}",
+        "Content-Type": "application/json",
+        "Device-Id": _device_id(),
+        "Browser-Token": _browser_token(),
+    }
 
     # Load lyrics from file if path given
     prompt = args.lyrics or ""
@@ -275,8 +302,13 @@ def poll_until_ready(jwt: str, clip_ids: list[str], timeout: int = 360,
             except SunoAuthError as e:
                 raise SunoAuthError(f"JWT refresh failed during poll: {e}") from e
 
-        headers = {**BASE_HEADERS, "Authorization": f"Bearer {current_jwt}",
-                   "Content-Type": "application/json"}
+        headers = {
+            **BASE_HEADERS,
+            "Authorization": f"Bearer {current_jwt}",
+            "Content-Type": "application/json",
+            "Device-Id": _device_id(),
+            "Browser-Token": _browser_token(),
+        }
         try:
             r = requests.post(f"{SUNO_API}/api/feed/v3", headers=headers,
                               json={"ids": clip_ids}, timeout=15)
@@ -346,6 +378,33 @@ def download_clips(clips: list[dict], out_dir: Path) -> list[Path]:
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
+def cmd_status(_args):
+    """Check auth state without generating anything."""
+    config = _load_config()
+    has_cookies = bool(config.get("browser_cookies"))
+    has_session = bool(config.get("session_cookie"))
+    jwt_age = time.time() - (config.get("jwt_saved_at") or 0)
+
+    print(f"Config:  {'~/.suno/config.json'}")
+    print(f"  browser_cookies saved:  {'yes (' + str(len(config['browser_cookies'])) + ' keys)' if has_cookies else 'NO'}")
+    print(f"  session_cookie saved:   {'yes' if has_session else 'NO'}")
+    print(f"  cached JWT age:         {jwt_age:.0f}s {'(expired)' if jwt_age > 55 else '(valid)'}")
+
+    if not has_cookies and not has_session:
+        print("\nNO AUTH — run suno-login.exe to save session cookie.")
+        sys.exit(2)
+
+    print("\nTesting JWT refresh...")
+    try:
+        jwt = _get_jwt_with_fallback(None)
+        print(f"  OK — got JWT: {jwt[:20]}...")
+        print("\nAuth is working.")
+    except SunoAuthError as e:
+        print(f"  FAILED: {e}")
+        print("\nSession expired — run suno-login.exe to re-authenticate.")
+        sys.exit(2)
+
+
 def cmd_auth(args):
     CONFIG_DIR = Path.home() / ".suno"
     CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -363,8 +422,7 @@ def cmd_auth(args):
         print("ERROR: That doesn't look like a valid JWT.")
         sys.exit(1)
 
-    with open(CONFIG_FILE, "w") as f:
-        json.dump({"jwt": token, "saved_at": time.time()}, f)
+    _save_config({"jwt": token, "jwt_saved_at": time.time()})
     print(f"\nToken saved to {CONFIG_FILE}")
     print("Valid ~60 seconds. Re-run 'auth' before each session.")
 
@@ -415,6 +473,9 @@ def main():
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    # status
+    sub.add_parser("status", help="Check auth state and test JWT refresh")
+
     # auth (manual fallback)
     a = sub.add_parser("auth", help="Manually paste a JWT token (fallback)")
     a.add_argument("--token", default=None, help="JWT string (omit for interactive prompt)")
@@ -450,7 +511,9 @@ def main():
     g.add_argument("--token",          default=None,   help="JWT token (for agent use, skips browser)")
 
     args = parser.parse_args()
-    if args.cmd == "auth":
+    if args.cmd == "status":
+        cmd_status(args)
+    elif args.cmd == "auth":
         cmd_auth(args)
     elif args.cmd == "generate":
         cmd_generate(args)
