@@ -135,8 +135,13 @@ def _jwt_from_session_cookie(session_cookie: str) -> str:
 
 
 def _jwt_from_browser_cookies(cookies: dict) -> str:
-    """Build cookie header from all saved browser cookies and exchange for JWT."""
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    """Build cookie header from saved browser cookies and exchange for JWT.
+    Only Clerk cookies are sent — sending all cookies causes 431 (header too large).
+    """
+    clerk_cookies = {k: v for k, v in cookies.items() if k.startswith(("__session", "__client"))}
+    if not clerk_cookies:
+        clerk_cookies = cookies  # fallback: send all if no Clerk cookies found
+    cookie_header = "; ".join(f"{k}={v}" for k, v in clerk_cookies.items())
     return _clerk_jwt(cookie_header)
 
 
@@ -209,6 +214,26 @@ def _browser_token() -> str:
     return json.dumps({"token": token_b64}, separators=(',', ':'))
 
 
+def _get_user_tier() -> str | None:
+    """Fetch plan ID from billing API. Cached in config to avoid extra calls."""
+    config = _load_config()
+    if config.get("user_tier"):
+        return config["user_tier"]
+    try:
+        jwt = _get_jwt_with_fallback(None)
+        headers = {**BASE_HEADERS, "Authorization": f"Bearer {jwt}",
+                   "Device-Id": _device_id(), "Browser-Token": _browser_token()}
+        r = requests.get(f"{SUNO_API}/api/billing/info/", headers=headers, timeout=10)
+        if r.status_code == 200:
+            tier = r.json().get("plan", {}).get("id")
+            if tier:
+                _save_config({"user_tier": tier})
+                return tier
+    except Exception:
+        pass
+    return None
+
+
 def _device_id() -> str:
     """Device-Id header — from saved suno_device_id cookie, or a stable generated UUID."""
     config = _load_config()
@@ -236,25 +261,49 @@ def generate(jwt: str, args) -> list[str]:
     if prompt and Path(prompt).exists():
         prompt = Path(prompt).read_text(encoding="utf-8")
 
+    user_tier = _get_user_tier()
+
     payload: dict = {
-        "prompt":           prompt,
-        "tags":             args.style,
-        "title":            args.title,
-        "make_instrumental": not args.vocals,
-        "mv":               MODEL,
+        "project_id":               None,
+        "token":                    None,
+        "generation_type":          "TEXT",
+        "title":                    args.title,
+        "tags":                     args.style,
+        "negative_tags":            args.exclude or "",
+        "mv":                       MODEL,
+        "prompt":                   prompt,
+        "make_instrumental":        not args.vocals,
+        "user_uploaded_images_b64": None,
+        "metadata": {
+            "web_client_pathname":          "/create",
+            "is_max_mode":                  False,
+            "is_mumble":                    False,
+            "create_mode":                  "custom" if prompt else "default",
+            "user_tier":                    user_tier,
+            "create_session_token":         str(uuid.uuid4()),
+            "disable_volume_normalization": False,
+            "control_sliders":              {"style_weight": 1},
+        },
+        "override_fields":   [],
+        "cover_clip_id":     None,
+        "cover_start_s":     None,
+        "cover_end_s":       None,
+        "persona_id":        None,
+        "artist_clip_id":    None,
+        "artist_start_s":    None,
+        "artist_end_s":      None,
+        "continue_clip_id":  None,
+        "continued_aligned_prompt": None,
+        "continue_at":       None,
+        "transaction_uuid":  str(uuid.uuid4()),
     }
 
-    # Optional fields — only sent if explicitly provided
-    if args.exclude:
-        payload["negative_tags"] = args.exclude
-
     if args.vocal_gender:
-        # Accept "male"/"female" or "m"/"f"
         g = args.vocal_gender.lower()
         payload["vocal_gender"] = "male" if g in ("male", "m") else "female"
 
     if args.lyrics_mode:
-        payload["lyrics_mode"] = args.lyrics_mode  # "manual" | "auto"
+        payload["lyrics_mode"] = args.lyrics_mode
 
     if args.weirdness is not None:
         payload["weirdness"] = max(0, min(100, args.weirdness))
