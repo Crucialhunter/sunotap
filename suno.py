@@ -31,6 +31,7 @@ SUNO_API  = "https://studio-api-prod.suno.com"
 CLERK_API = "https://clerk.suno.com"
 MODEL     = "chirp-fenix"          # Suno v5.5
 CLERK_VER = "_clerk_js_version=5.35.1"
+SUNO_LOGIN_EXE = Path(__file__).parent / "suno-login.exe"
 
 # ── Error types ───────────────────────────────────────────────────────────────
 
@@ -48,7 +49,55 @@ BASE_HEADERS = {
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://suno.com",
+    "Referer": "https://suno.com/",
 }
+
+# ── JWT helpers ──────────────────────────────────────────────────────────────
+
+def _jwt_exp(jwt: str) -> float:
+    """Decode JWT exp claim (epoch seconds). Returns 0 on error."""
+    try:
+        payload = jwt.split(".")[1]
+        data = json.loads(base64.b64decode(payload + "=="))
+        return float(data.get("exp", 0))
+    except Exception:
+        return 0
+
+
+def _update_rotated_cookies(response) -> None:
+    """Save cookies Clerk rotates in Set-Cookie response headers."""
+    if not response.cookies:
+        return
+    config = _load_config()
+    saved = config.get("browser_cookies")
+    if not saved:
+        return
+    changed = False
+    for name, val in response.cookies.items():
+        if name in saved and saved[name] != val:
+            saved[name] = val
+            changed = True
+    if changed:
+        _save_config({"browser_cookies": saved})
+
+
+def _offer_reauth() -> None:
+    """Offer re-authentication guidance and exit with auth error code."""
+    import platform
+    if platform.system() == "Windows" and SUNO_LOGIN_EXE.exists():
+        import subprocess
+        print(f"\nLaunching {SUNO_LOGIN_EXE.name} to re-authenticate...")
+        subprocess.Popen([str(SUNO_LOGIN_EXE)])
+        print("Log in to Suno in the window that opened, then retry this command.")
+    else:
+        print("\nSession expired. To re-authenticate:")
+        print("  1. Run suno-login.exe on your Windows machine")
+        print("  2. Copy ~/.suno/config.json to this machine")
+        print("     e.g.: scp windows-host:~/.suno/config.json ~/.suno/config.json")
+    sys.exit(2)
+
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -95,20 +144,26 @@ def _clerk_jwt(cookie_header: str) -> str:
     if r.status_code != 200:
         raise SunoAuthError(f"Clerk returned {r.status_code}: {r.text[:200]}")
 
+    # Save any cookies Clerk rotated in this response (e.g. __client)
+    _update_rotated_cookies(r)
+
     sessions = r.json().get("response", {}).get("sessions", [])
     if not sessions:
         raise SunoAuthError("No active Clerk session — log in to suno.com first, or run suno-login.exe.")
 
-    sid = sessions[0]["id"]
-    r = requests.post(
+    # Prefer sessions tagged "active"; fall back to first if none tagged
+    active = [s for s in sessions if s.get("status") == "active"]
+    sid = (active or sessions)[0]["id"]
+
+    r2 = requests.post(
         f"{CLERK_API}/v1/client/sessions/{sid}/tokens?{CLERK_VER}",
         headers=headers, timeout=10,
     )
-    if r.status_code == 401:
+    if r2.status_code == 401:
         raise SunoAuthError("Session expired (401 on token exchange) — run suno-login.exe.")
-    if r.status_code != 200:
-        raise SunoAuthError(f"Token exchange failed {r.status_code}: {r.text[:200]}")
-    return r.json()["jwt"]
+    if r2.status_code != 200:
+        raise SunoAuthError(f"Token exchange failed {r2.status_code}: {r2.text[:200]}")
+    return r2.json()["jwt"]
 
 
 def _load_config() -> dict:
@@ -138,7 +193,8 @@ def _jwt_from_browser_cookies(cookies: dict) -> str:
     """Build cookie header from saved browser cookies and exchange for JWT.
     Only Clerk cookies are sent — sending all cookies causes 431 (header too large).
     """
-    clerk_cookies = {k: v for k, v in cookies.items() if k.startswith(("__session", "__client"))}
+    clerk_cookies = {k: v for k, v in cookies.items()
+                     if k.startswith(("__session", "__client", "clerk"))}
     if not clerk_cookies:
         clerk_cookies = cookies  # fallback: send all if no Clerk cookies found
     cookie_header = "; ".join(f"{k}={v}" for k, v in clerk_cookies.items())
@@ -152,9 +208,11 @@ def _get_jwt_with_fallback(token_arg: str | None) -> str:
 
     config = _load_config()
 
-    # 2. Cached JWT still valid
-    if config.get("jwt") and time.time() - (config.get("jwt_saved_at") or 0) < 55:
-        return config["jwt"]
+    # 2. Cached JWT still valid (check actual exp claim, 120s safety margin)
+    if config.get("jwt"):
+        exp = _jwt_exp(config["jwt"])
+        if exp and time.time() < exp - 120:
+            return config["jwt"]
 
     # 3a. Refresh using all browser cookies (saved by suno-login — preferred)
     if config.get("browser_cookies"):
@@ -189,8 +247,7 @@ def _get_jwt_with_fallback(token_arg: str | None) -> str:
     except Exception as e:
         raise SunoAuthError(
             f"All auth methods failed. Last error: {e}\n"
-            "Fix: run suno-login.exe (saves session_cookie to ~/.suno/config.json), "
-            "or use --token with a fresh JWT from suno.com console: "
+            "Fix: run suno-login.exe, or use --token with a fresh JWT from suno.com console: "
             "window.Clerk.session.getToken()"
         ) from e
 
@@ -341,10 +398,11 @@ def poll_until_ready(jwt: str, clip_ids: list[str], timeout: int = 360,
     start = time.time()
 
     while time.time() - start < timeout:
-        # Refresh JWT if it's been >50s (expires at 60s).
-        # Never reuse token_arg here — it was already used to start generation
-        # and is now expired. Fall through to session_cookie / config cache instead.
-        if time.time() - jwt_refreshed_at > 50:
+        # Refresh JWT when it has <120s remaining (actual exp from JWT claim).
+        # Never reuse token_arg — it was used to start generation and may now be expired.
+        jwt_exp = _jwt_exp(current_jwt)
+        needs_refresh = jwt_exp and time.time() > jwt_exp - 120
+        if needs_refresh or (not jwt_exp and time.time() - jwt_refreshed_at > 3300):
             try:
                 current_jwt = _get_jwt_with_fallback(None)
                 jwt_refreshed_at = time.time()
@@ -427,31 +485,77 @@ def download_clips(clips: list[dict], out_dir: Path) -> list[Path]:
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
+def _get_session_expiry_from_config() -> float | None:
+    """Return Unix timestamp of Clerk session expiry, or None on error."""
+    config = _load_config()
+    cookies = config.get("browser_cookies") or {}
+    clerk = {k: v for k, v in cookies.items() if k.startswith(("__session", "__client"))}
+    if not clerk and config.get("session_cookie"):
+        clerk = {"__session": config["session_cookie"]}
+    if not clerk:
+        return None
+    cookie_header = "; ".join(f"{k}={v}" for k, v in clerk.items())
+    headers = {**BASE_HEADERS, "Cookie": cookie_header}
+    try:
+        r = requests.get(f"{CLERK_API}/v1/client?{CLERK_VER}", headers=headers, timeout=10)
+        if r.status_code != 200:
+            return None
+        _update_rotated_cookies(r)
+        sessions = r.json().get("response", {}).get("sessions", [])
+        if not sessions:
+            return None
+        active = [s for s in sessions if s.get("status") == "active"]
+        session = (active or sessions)[0]
+        exp = session.get("expire_at") or session.get("expireAt")
+        if exp:
+            return exp / 1000 if exp > 1e10 else float(exp)
+    except Exception:
+        pass
+    return None
+
+
 def cmd_status(_args):
     """Check auth state without generating anything."""
     config = _load_config()
     has_cookies = bool(config.get("browser_cookies"))
     has_session = bool(config.get("session_cookie"))
-    jwt_age = time.time() - (config.get("jwt_saved_at") or 0)
 
-    print(f"Config:  {'~/.suno/config.json'}")
+    cached_jwt = config.get("jwt", "")
+    jwt_exp = _jwt_exp(cached_jwt) if cached_jwt else 0
+    jwt_remaining = jwt_exp - time.time() if jwt_exp else -1
+    jwt_status = f"valid ({jwt_remaining:.0f}s left)" if jwt_remaining > 0 else "expired"
+
+    print(f"Config:  ~/.suno/config.json")
     print(f"  browser_cookies saved:  {'yes (' + str(len(config['browser_cookies'])) + ' keys)' if has_cookies else 'NO'}")
     print(f"  session_cookie saved:   {'yes' if has_session else 'NO'}")
-    print(f"  cached JWT age:         {jwt_age:.0f}s {'(expired)' if jwt_age > 55 else '(valid)'}")
+    print(f"  cached JWT:             {jwt_status}")
 
     if not has_cookies and not has_session:
         print("\nNO AUTH — run suno-login.exe to save session cookie.")
-        sys.exit(2)
+        _offer_reauth()
 
     print("\nTesting JWT refresh...")
     try:
         jwt = _get_jwt_with_fallback(None)
-        print(f"  OK — got JWT: {jwt[:20]}...")
-        print("\nAuth is working.")
+        new_exp = _jwt_exp(jwt)
+        print(f"  OK — JWT valid for {(new_exp - time.time()) / 60:.0f} min")
     except SunoAuthError as e:
         print(f"  FAILED: {e}")
-        print("\nSession expired — run suno-login.exe to re-authenticate.")
-        sys.exit(2)
+        print("\nSession expired.")
+        _offer_reauth()
+
+    print("\nChecking session lifetime...")
+    expiry = _get_session_expiry_from_config()
+    if expiry:
+        days = (expiry - time.time()) / 86400
+        exp_str = time.strftime("%Y-%m-%d", time.localtime(expiry))
+        print(f"  Session expires: {exp_str} ({days:.0f} days from now)")
+        if days < 30:
+            print(f"  WARNING: session expires in {days:.0f} days — run suno-login.exe soon.")
+    else:
+        print("  (could not read session expiry)")
+
+    print("\nAuth is working.")
 
 
 def cmd_auth(args):
@@ -503,7 +607,7 @@ def cmd_generate(args):
 
     except SunoAuthError as e:
         print(f"\nAUTH ERROR: {e}", file=sys.stderr)
-        sys.exit(2)
+        _offer_reauth()
     except SunoRateLimitError as e:
         print(f"\nRATE LIMIT: {e}", file=sys.stderr)
         sys.exit(3)
