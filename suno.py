@@ -315,7 +315,12 @@ def generate(jwt: str, args) -> list[str]:
 
     # Load lyrics from file if path given
     prompt = args.lyrics or ""
-    if prompt and Path(prompt).exists():
+    def _is_file_path(s: str) -> bool:
+        try:
+            return bool(s) and Path(s).exists()
+        except OSError:
+            return False
+    if _is_file_path(prompt):
         prompt = Path(prompt).read_text(encoding="utf-8")
 
     user_tier = _get_user_tier()
