@@ -33,6 +33,10 @@ MODEL     = "chirp-fenix"          # Suno v5.5
 CLERK_VER = "_clerk_js_version=5.35.1"
 SUNO_LOGIN_EXE = Path(__file__).parent / "suno-login.exe"
 
+# hCaptcha tokens are single-use; Suno's custom endpoint appears to keep them
+# valid for about 120s — use 90s to be safe.
+HCAPTCHA_TTL = 90
+
 # ── Error types ───────────────────────────────────────────────────────────────
 
 class SunoAuthError(Exception):
@@ -43,6 +47,9 @@ class SunoRateLimitError(Exception):
 
 class SunoAPIError(Exception):
     """Unexpected API error with status code and body."""
+
+class SunoCaptchaError(Exception):
+    """hCaptcha token required but not available."""
 
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -271,6 +278,101 @@ def _browser_token() -> str:
     return json.dumps({"token": token_b64}, separators=(',', ':'))
 
 
+def _check_captcha_required(jwt: str) -> bool:
+    """Ask Suno whether an hCaptcha token is required for generation."""
+    headers = {
+        **BASE_HEADERS,
+        "Authorization": f"Bearer {jwt}",
+        "Browser-Token": _browser_token(),
+        "Device-Id": _device_id(),
+    }
+    try:
+        r = requests.post(
+            f"{SUNO_API}/api/c/check",
+            headers=headers,
+            json={"ctype": "generation"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json().get("required", False) is True
+    except Exception as e:
+        print(f"  Warning: captcha check failed ({e}) — assuming required")
+    return True  # safe default
+
+
+def _get_cached_captcha_token() -> str | None:
+    """Return a cached hCaptcha token if it's still within TTL, else None."""
+    config = _load_config()
+    token = config.get("captcha_token")
+    saved_at = config.get("captcha_token_saved_at", 0)
+    if token and (time.time() - saved_at) < HCAPTCHA_TTL:
+        return token
+    return None
+
+
+def _captcha_capture_server() -> str | None:
+    """Start a local HTTP server to receive an hCaptcha token pasted from the browser."""
+    import threading
+    import http.server
+
+    PORT = 7824
+    token_holder: list[str | None] = [None]
+    srv_holder: list[http.server.HTTPServer | None] = [None]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_OPTIONS(self):
+            self.send_response(200)
+            for h, v in [("Access-Control-Allow-Origin", "*"),
+                         ("Access-Control-Allow-Methods", "POST, OPTIONS"),
+                         ("Access-Control-Allow-Headers", "Content-Type")]:
+                self.send_header(h, v)
+            self.end_headers()
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(n))
+            token_holder[0] = data.get("token") or ""
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            threading.Thread(target=srv_holder[0].shutdown).start()  # type: ignore[union-attr]
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    srv_holder[0] = srv
+
+    print("\n  hCaptcha token required. Open suno.com in your browser,")
+    print("  press F12 → Console, and run:\n")
+    print(f"    (async()=>{{")
+    print(f"      let f=document.querySelector('#__next').__reactFiber;")
+    print(f"      function fs(f,d=0){{if(!f||d>100)return null;")
+    print(f"      const v=f.memoizedProps?.value;")
+    print(f"      if(v?.session?.getCaptchaTokenIfRequired)return v.session;")
+    print(f"      return fs(f.child,d+1)||fs(f.sibling,d+1);}}")
+    print(f"      const t=await fs(f).getCaptchaTokenIfRequired('generation');")
+    print(f"      await fetch('http://127.0.0.1:{PORT}/',{{method:'POST',")
+    print(f"        headers:{{'Content-Type':'application/json'}},")
+    print(f"        body:JSON.stringify({{token:t}})}});")
+    print(f"    }})()\n")
+    print(f"  Waiting for token (60s timeout)...")
+
+    timer = threading.Timer(62, srv.shutdown)
+    timer.start()
+    srv.serve_forever()
+    timer.cancel()
+
+    token = token_holder[0]
+    if token:
+        _save_config({"captcha_token": token, "captcha_token_saved_at": time.time()})
+        print("  hCaptcha token received and cached.")
+    else:
+        print("  Timed out waiting for hCaptcha token.")
+    return token or None
+
+
 def _get_user_tier() -> str | None:
     """Fetch plan ID from billing API. Cached in config to avoid extra calls."""
     config = _load_config()
@@ -313,6 +415,17 @@ def generate(jwt: str, args) -> list[str]:
         "Browser-Token": _browser_token(),
     }
 
+    # ── hCaptcha check ───────────────────────────────────────────────────────
+    captcha_token: str | None = None
+    captcha_token_arg = getattr(args, "captcha_token", None)
+    if _check_captcha_required(jwt):
+        captcha_token = captcha_token_arg or _get_cached_captcha_token()
+        if not captcha_token:
+            raise SunoCaptchaError(
+                "hCaptcha token required. Re-run with --captcha-token or "
+                "use --captcha-server to capture one interactively."
+            )
+
     # Load lyrics from file if path given
     prompt = args.lyrics or ""
     def _is_file_path(s: str) -> bool:
@@ -327,7 +440,7 @@ def generate(jwt: str, args) -> list[str]:
 
     payload: dict = {
         "project_id":               None,
-        "token":                    None,
+        "token":                    captcha_token,
         "generation_type":          "TEXT",
         "title":                    args.title,
         "tags":                     args.style,
@@ -560,6 +673,22 @@ def cmd_status(_args):
     else:
         print("  (could not read session expiry)")
 
+    print("\nChecking captcha requirement...")
+    try:
+        jwt_for_check = _get_jwt_with_fallback(None)
+        captcha_req = _check_captcha_required(jwt_for_check)
+        cached_tok = _get_cached_captcha_token()
+        print(f"  hCaptcha required for generate: {'YES' if captcha_req else 'no'}")
+        if captcha_req:
+            if cached_tok:
+                config = _load_config()
+                age = time.time() - config.get("captcha_token_saved_at", 0)
+                print(f"  Cached token: valid ({age:.0f}s old, TTL {HCAPTCHA_TTL}s)")
+            else:
+                print(f"  Cached token: none — use --captcha-server before generating")
+    except Exception as e:
+        print(f"  (captcha check failed: {e})")
+
     print("\nAuth is working.")
 
 
@@ -587,6 +716,15 @@ def cmd_auth(args):
 
 def cmd_generate(args):
     token_arg = getattr(args, "token", None)
+
+    # Interactive hCaptcha capture requested before generate
+    if getattr(args, "captcha_server", False):
+        token = _captcha_capture_server()
+        if not token:
+            print("\nNo captcha token received — aborting.", file=sys.stderr)
+            sys.exit(2)
+        print()
+
     try:
         print("Getting token...")
         jwt = _get_jwt_with_fallback(token_arg)
@@ -613,6 +751,12 @@ def cmd_generate(args):
     except SunoAuthError as e:
         print(f"\nAUTH ERROR: {e}", file=sys.stderr)
         _offer_reauth()
+    except SunoCaptchaError as e:
+        print(f"\nCAPTCHA ERROR: {e}", file=sys.stderr)
+        print("\nOptions:", file=sys.stderr)
+        print("  1. Interactive:  python suno.py generate --captcha-server ...", file=sys.stderr)
+        print("  2. Manual token: python suno.py generate --captcha-token <token> ...", file=sys.stderr)
+        sys.exit(2)
     except SunoRateLimitError as e:
         print(f"\nRATE LIMIT: {e}", file=sys.stderr)
         sys.exit(3)
@@ -667,6 +811,10 @@ def main():
     g.add_argument("--download",       action="store_true", help="Download MP3s when done (requires --wait)")
     g.add_argument("--out",            default="~/music/suno", help="Output directory for MP3s")
     g.add_argument("--token",          default=None,   help="JWT token (for agent use, skips browser)")
+    g.add_argument("--captcha-token",  default=None,   dest="captcha_token",
+                                                        help="hCaptcha token (get from browser console)")
+    g.add_argument("--captcha-server", action="store_true", dest="captcha_server",
+                                                        help="Start local server to capture hCaptcha token interactively")
 
     args = parser.parse_args()
     if args.cmd == "status":
