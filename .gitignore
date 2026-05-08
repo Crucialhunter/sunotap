@@ -6,6 +6,9 @@ config.json
 suno-login.exe
 suno-login/src-tauri/target/
 suno-login/icon-source.png
+suno-captcha.exe
+suno-captcha/src-tauri/target/
+suno-captcha/icon-source.png
 
 # Python
 __pycache__/

@@ -300,6 +300,21 @@ def _check_captcha_required(jwt: str) -> bool:
     return True  # safe default
 
 
+def _get_captcha_token_from_service() -> str | None:
+    """Ask suno-captcha.exe (running locally) for a token. Returns None if unavailable."""
+    config = _load_config()
+    url = config.get("captcha_service_url", "http://127.0.0.1:7825")
+    try:
+        r = requests.get(f"{url}/token", timeout=3)
+        if r.status_code == 200:
+            token = r.json().get("token")
+            if token:
+                return token
+    except Exception:
+        pass
+    return None
+
+
 def _get_cached_captcha_token() -> str | None:
     """Return a cached hCaptcha token if it's still within TTL, else None."""
     config = _load_config()
@@ -345,17 +360,17 @@ def _captcha_capture_server() -> str | None:
     srv_holder[0] = srv
 
     print("\n  hCaptcha token required. Open suno.com in your browser,")
-    print("  press F12 → Console, and run:\n")
+    print("  press F12 -> Console, and run:\n")
     print(f"    (async()=>{{")
-    print(f"      let f=document.querySelector('#__next').__reactFiber;")
-    print(f"      function fs(f,d=0){{if(!f||d>100)return null;")
-    print(f"      const v=f.memoizedProps?.value;")
-    print(f"      if(v?.session?.getCaptchaTokenIfRequired)return v.session;")
-    print(f"      return fs(f.child,d+1)||fs(f.sibling,d+1);}}")
-    print(f"      const t=await fs(f).getCaptchaTokenIfRequired('generation');")
+    print(f"      const c=document.createElement('div');")
+    print(f"      c.style.display='none';")
+    print(f"      document.body.appendChild(c);")
+    print(f"      const wid=window.hcaptcha.render(c,{{")
+    print(f"        sitekey:'d65453de-3f1a-4aac-9366-a0f06e52b2ce',size:'invisible'}});")
+    print(f"      const r=await window.hcaptcha.execute(wid,{{async:true}});")
     print(f"      await fetch('http://127.0.0.1:{PORT}/',{{method:'POST',")
     print(f"        headers:{{'Content-Type':'application/json'}},")
-    print(f"        body:JSON.stringify({{token:t}})}});")
+    print(f"        body:JSON.stringify({{token:r.response}})}});")
     print(f"    }})()\n")
     print(f"  Waiting for token (60s timeout)...")
 
@@ -419,11 +434,17 @@ def generate(jwt: str, args) -> list[str]:
     captcha_token: str | None = None
     captcha_token_arg = getattr(args, "captcha_token", None)
     if _check_captcha_required(jwt):
-        captcha_token = captcha_token_arg or _get_cached_captcha_token()
+        captcha_token = (
+            captcha_token_arg                    # explicit --captcha-token
+            or _get_cached_captcha_token()       # locally cached
+            or _get_captcha_token_from_service() # suno-captcha.exe service
+        )
         if not captcha_token:
             raise SunoCaptchaError(
-                "hCaptcha token required. Re-run with --captcha-token or "
-                "use --captcha-server to capture one interactively."
+                "hCaptcha token required. Options:\n"
+                "  1. Run suno-captcha.exe (auto, recommended)\n"
+                "  2. python suno.py generate --captcha-server ...\n"
+                "  3. python suno.py generate --captcha-token <token> ..."
             )
 
     # Load lyrics from file if path given
@@ -692,6 +713,56 @@ def cmd_status(_args):
     print("\nAuth is working.")
 
 
+def cmd_pair(_args):
+    """Discover suno-captcha.exe on the LAN via UDP broadcast and save its address."""
+    import socket as _sock
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+    s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+    try:
+        s.bind(('', 7826))
+    except OSError as e:
+        print(f"Cannot listen on UDP port 7826: {e}")
+        sys.exit(1)
+    s.settimeout(30)
+
+    print("Waiting for suno-captcha.exe broadcast (30s)...")
+    print("On Windows: right-click the tray icon -> 'Pair with LXC...'\n")
+
+    try:
+        data, _ = s.recvfrom(1024)
+        info = json.loads(data.decode())
+        ip, port = info['ip'], info['port']
+        service_url = f"http://{ip}:{port}"
+
+        print(f"Found: suno-captcha at {service_url}")
+        print(f"Save and test connection? [y/N]: ", end='', flush=True)
+
+        if input().strip().lower() != 'y':
+            print("Cancelled.")
+            return
+
+        try:
+            r = requests.get(f"{service_url}/health", timeout=3)
+            if r.ok:
+                _save_config({"captcha_service_url": service_url})
+                print(f"Paired and verified. Captcha service: {service_url}")
+            else:
+                print(f"Warning: health check returned {r.status_code}. Saving anyway.")
+                _save_config({"captcha_service_url": service_url})
+        except Exception as e:
+            print(f"Warning: could not verify connection ({e}).")
+            print("Save anyway? [y/N]: ", end='', flush=True)
+            if input().strip().lower() == 'y':
+                _save_config({"captcha_service_url": service_url})
+                print("Saved.")
+
+    except _sock.timeout:
+        print("\nNo broadcast received in 30s.")
+        print("Ensure suno-captcha.exe is running, then click 'Pair with LXC...' in the tray.")
+    finally:
+        s.close()
+
+
 def cmd_auth(args):
     CONFIG_DIR = Path.home() / ".suno"
     CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -778,6 +849,9 @@ def main():
     # status
     sub.add_parser("status", help="Check auth state and test JWT refresh")
 
+    # pair
+    sub.add_parser("pair", help="Pair with suno-captcha.exe service on Windows via LAN")
+
     # auth (manual fallback)
     a = sub.add_parser("auth", help="Manually paste a JWT token (fallback)")
     a.add_argument("--token", default=None, help="JWT string (omit for interactive prompt)")
@@ -819,6 +893,8 @@ def main():
     args = parser.parse_args()
     if args.cmd == "status":
         cmd_status(args)
+    elif args.cmd == "pair":
+        cmd_pair(args)
     elif args.cmd == "auth":
         cmd_auth(args)
     elif args.cmd == "generate":
