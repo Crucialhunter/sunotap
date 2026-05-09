@@ -278,17 +278,29 @@ fn get_local_ip() -> Option<String> {
     Some(s.local_addr().ok()?.ip().to_string())
 }
 
-fn broadcast_pairing() {
+fn broadcast_pairing() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
     let ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_owned());
-    let payload = format!(r#"{{"ip":"{ip}","port":{PORT}}}"#);
-    let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") else { return };
+    // 4-digit code, derived from nanosecond timestamp (good enough — not crypto)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let code = format!("{:04}", (nanos % 9000) + 1000);
+
+    let payload = format!(
+        r#"{{"ip":"{ip}","port":{PORT},"code":"{code}"}}"#
+    );
+
+    let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") else { return code };
     let _ = s.set_broadcast(true);
     let target = format!("255.255.255.255:{PAIR_PORT}");
     for _ in 0..5 {
         let _ = s.send_to(payload.as_bytes(), &target);
         thread::sleep(Duration::from_millis(300));
     }
-    eprintln!("[captcha] pairing broadcast sent — service at {ip}:{PORT}");
+    eprintln!("[captcha] broadcast sent — {ip}:{PORT}, code {code}");
+    code
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
@@ -339,13 +351,16 @@ fn main() {
                 .on_menu_event(move |_app, ev| {
                     match ev.id().as_ref() {
                         "pair" => {
-                            // Fire-and-forget: 5 UDP broadcasts, then done.
+                            // Fire-and-forget broadcast. Code stays visible in
+                            // tooltip for 60s so user can type it into the app.
                             let state = Arc::clone(&state_tray);
                             thread::spawn(move || {
-                                broadcast_pairing();
+                                let code = broadcast_pairing();
                                 if let Some(t) = state.tray.lock().unwrap().as_ref() {
-                                    let _ = t.set_tooltip(Some("Suno Captcha — pairing sent"));
-                                    thread::sleep(Duration::from_secs(5));
+                                    let _ = t.set_tooltip(Some(
+                                        &format!("Pairing code: {code}  (60s)")
+                                    ));
+                                    thread::sleep(Duration::from_secs(60));
                                     let _ = t.set_tooltip(Some("Suno Captcha — ready"));
                                 }
                             });

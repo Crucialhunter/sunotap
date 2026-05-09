@@ -732,9 +732,12 @@ def cmd_pair(_args):
         data, _ = s.recvfrom(1024)
         info = json.loads(data.decode())
         ip, port = info['ip'], info['port']
+        code = info.get('code', '')
         service_url = f"http://{ip}:{port}"
 
         print(f"Found: suno-captcha at {service_url}")
+        if code:
+            print(f"Pairing code: {code}  (verify it matches the Windows tray tooltip)")
         print(f"Save and test connection? [y/N]: ", end='', flush=True)
 
         if input().strip().lower() != 'y':
