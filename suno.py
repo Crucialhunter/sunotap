@@ -459,6 +459,17 @@ def generate(jwt: str, args) -> list[str]:
 
     user_tier = _get_user_tier()
 
+    # Slider values live in metadata.control_sliders. Suno expects 0-1 floats
+    # (UI shows 0-100% but state is divided by 100 before sending). Keys must
+    # match Suno's exact names: weirdness_constraint / style_weight.
+    # The web UI omits each field entirely when at default — we mirror that
+    # behavior to avoid forcing values the user didn't ask for.
+    control_sliders: dict = {}
+    if args.weirdness is not None:
+        control_sliders["weirdness_constraint"] = max(0, min(100, args.weirdness)) / 100
+    if args.style_influence is not None:
+        control_sliders["style_weight"] = max(0, min(100, args.style_influence)) / 100
+
     payload: dict = {
         "project_id":               None,
         "token":                    captcha_token,
@@ -478,7 +489,7 @@ def generate(jwt: str, args) -> list[str]:
             "user_tier":                    user_tier,
             "create_session_token":         str(uuid.uuid4()),
             "disable_volume_normalization": False,
-            "control_sliders":              {"style_weight": 1},
+            "control_sliders":              control_sliders,
         },
         "override_fields":   [],
         "cover_clip_id":     None,
@@ -500,12 +511,6 @@ def generate(jwt: str, args) -> list[str]:
 
     if args.lyrics_mode:
         payload["lyrics_mode"] = args.lyrics_mode
-
-    if args.weirdness is not None:
-        payload["weirdness"] = max(0, min(100, args.weirdness))
-
-    if args.style_influence is not None:
-        payload["style_influence"] = max(0, min(100, args.style_influence))
 
     try:
         r = requests.post(f"{SUNO_API}/api/generate/v2-web/", headers=headers, json=payload, timeout=30)
