@@ -111,8 +111,44 @@ fn url_decode(s: &str) -> String {
 // so suno.com's connect-src CSP policy never blocks us.
 
 const CAPTCHA_JS: &str = r#"
-(function() {
+(async function() {
   try {
+    // Suno lazy-loads hcaptcha.js only when the user interacts with the
+    // Create form. In headless WebView2 there's no interaction, so we
+    // need to inject the hcaptcha script ourselves if it's not present.
+    async function loadScript(src) {
+      return new Promise(function(resolve){
+        var s = document.createElement('script');
+        s.src = src; s.async = true;
+        s.onload = function(){ resolve(true); };
+        s.onerror = function(){ resolve(false); };
+        document.head.appendChild(s);
+      });
+    }
+    async function waitFor(predicate, timeoutMs) {
+      var start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        if (predicate()) return true;
+        await new Promise(function(r){ setTimeout(r, 200); });
+      }
+      return false;
+    }
+
+    if (typeof window.hcaptcha === 'undefined') {
+      // Try Suno's custom endpoint first (matches what the web UI uses),
+      // fall back to the official hCaptcha CDN if that fails.
+      var sources = [
+        'https://hcaptcha-endpoint-prod.suno.com/1/api.js?render=explicit',
+        'https://js.hcaptcha.com/1/api.js?render=explicit'
+      ];
+      for (var i = 0; i < sources.length; i++) {
+        await loadScript(sources[i]);
+        if (await waitFor(function(){ return typeof window.hcaptcha !== 'undefined'; }, 8000)) {
+          break;
+        }
+      }
+    }
+
     if (typeof window.hcaptcha === 'undefined') {
       window.location.hash = '__sc_err__' + encodeURIComponent('hcaptcha_not_loaded');
       return;
@@ -154,8 +190,9 @@ fn fetch_token(window: &tauri::WebviewWindow) -> Result<String, String> {
     // Fire the invisible captcha widget
     let _ = window.eval(CAPTCHA_JS);
 
-    // Poll the page URL for the result hash (max 15 s)
-    for _ in 0..150 {
+    // Poll the page URL for the result hash (max 30 s — the JS itself may
+    // wait up to 20 s for window.hcaptcha to load before even attempting render).
+    for _ in 0..300 {
         thread::sleep(Duration::from_millis(100));
         if let Ok(url) = window.url() {
             let s = url.to_string();
@@ -373,11 +410,14 @@ fn main() {
 
             *state.tray.lock().unwrap() = Some(tray);
 
-            // Hidden WebView2 window loading suno.com
+            // Hidden WebView2 window loading suno.com/create
+            // (we land on /create directly because hcaptcha.js is lazy-loaded
+            // by Suno only on pages that need it — /discover usually doesn't
+            // load it, /create reliably does)
             let window = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
-                tauri::WebviewUrl::External("https://suno.com".parse()?),
+                tauri::WebviewUrl::External("https://suno.com/create".parse()?),
             )
             .visible(false)
             .skip_taskbar(true)
